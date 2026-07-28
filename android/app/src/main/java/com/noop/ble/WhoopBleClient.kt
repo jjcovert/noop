@@ -15,7 +15,10 @@ import android.Manifest
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
@@ -5896,8 +5899,91 @@ class WhoopBleClient(
         }
         when (connectedFamily) {
             DeviceFamily.WHOOP4 -> writeBondFrame(g, cmd)
-            DeviceFamily.WHOOP5 -> writeClientHello(g, cmd)
+            // 5/MG: every fd4b operation needs an ENCRYPTED link first. On Apple, CoreBluetooth raises
+            // that bond transparently when the CLIENT_HELLO touches the encrypted characteristic; on
+            // Android nothing does, so the write stalls and the link dies before any guard can fire.
+            // Ask for the bond explicitly, then resume. See [Whoop5BondGate].
+            DeviceFamily.WHOOP5 -> when (Whoop5BondGate.actionFor(DeviceFamily.WHOOP5, g.device.bondState)) {
+                BondAction.PROCEED -> writeClientHello(g, cmd)
+                BondAction.CREATE_BOND -> requestWhoop5Bond(g)
+                BondAction.WAIT -> log("WHOOP 5/MG: an OS bond is already in flight — waiting for it")
+            }
         }
+    }
+
+    /** Registered only while a 5/MG bond is in flight; null otherwise. Cleared in [reset]. */
+    private var bondReceiver: BroadcastReceiver? = null
+
+    /**
+     * Ask the OS to bond with the 5/MG strap, and resume the handshake when it lands.
+     *
+     * Android does not raise a just-works bond off the back of a confirmed write to an encrypted
+     * characteristic the way CoreBluetooth does, so without this the CLIENT_HELLO never completes:
+     * `onCharacteristicWrite` never fires, the refusal counters never increment, and the link is torn
+     * down at ~4s — before the 7s bond watchdog. `docs/ANDROID.md` anticipated needing this.
+     */
+    @SuppressLint("MissingPermission")
+    private fun requestWhoop5Bond(g: BluetoothGatt) {
+        val device = g.device
+        if (bondReceiver != null) {
+            log("WHOOP 5/MG bond: already waiting on a bond-state change")
+            return
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                @Suppress("DEPRECATION")
+                val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                if (dev?.address != device.address) return
+                val now = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, Whoop5BondGate.BOND_NONE)
+                val was = intent.getIntExtra(
+                    BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, Whoop5BondGate.BOND_NONE,
+                )
+                when {
+                    now == Whoop5BondGate.BOND_BONDED -> {
+                        log("WHOOP 5/MG bond: BONDED — resuming the handshake (CLIENT_HELLO)")
+                        unregisterBondReceiver()
+                        // Back to the callback thread before touching GATT: Android serializes GATT
+                        // operations on the looper the client was opened with.
+                        handler.post {
+                            val ch = cmdCharacteristic
+                            if (ch != null) writeClientHello(g, ch)
+                            else log("WHOOP 5/MG bond: bonded, but the command characteristic is gone")
+                        }
+                    }
+                    now == Whoop5BondGate.BOND_NONE && was == Whoop5BondGate.BOND_BONDING -> {
+                        // A genuine refusal, unlike the silent stall this method exists to fix.
+                        log("WHOOP 5/MG bond: REFUSED by the strap (bonding -> none)")
+                        unregisterBondReceiver()
+                    }
+                    else -> log("WHOOP 5/MG bond: state $was -> $now")
+                }
+            }
+        }
+        bondReceiver = receiver
+        val registered = runCatching {
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+        }.isSuccess
+        if (!registered) {
+            log("WHOOP 5/MG bond: could not register the bond-state receiver")
+            bondReceiver = null
+            return
+        }
+        val requested = runCatching { device.createBond() }.getOrDefault(false)
+        log("WHOOP 5/MG bond: createBond() requested -> $requested")
+        if (!requested) unregisterBondReceiver()
+    }
+
+    /** Idempotent: safe to call when nothing is registered. */
+    private fun unregisterBondReceiver() {
+        val r = bondReceiver ?: return
+        bondReceiver = null
+        runCatching { context.unregisterReceiver(r) }
     }
 
     @SuppressLint("MissingPermission")
@@ -6963,6 +7049,8 @@ class WhoopBleClient(
     private fun reset() {
         didBond = false
         connectHandshakeDone = false
+        // A bond-state receiver outliving its connection would resume a handshake onto a dead GATT.
+        unregisterBondReceiver()
         seq.set(0)
         writeQueue.clear()
         cccdQueue.clear()
