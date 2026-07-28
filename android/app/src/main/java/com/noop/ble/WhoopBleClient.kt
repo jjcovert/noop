@@ -1829,8 +1829,6 @@ class WhoopBleClient(
     /// The strap family the user chose to pair, remembered so an auto-reconnect after a
     /// dropout re-scans for the same model instead of falling back to WHOOP 4.0.
     private var selectedModel = WhoopModel.WHOOP4
-    /** #716: true once the seeded "WHOOP" model has been stamped to the correct family. */
-    private var modelStamped = false
     /// The last device we connected to, kept so an auto-reconnect after a dropout can connect
     /// DIRECTLY to it (autoConnect=true) instead of scanning. A bonded strap the OS still holds (or
     /// that simply isn't advertising) won't appear in a scan — so the old scan-only reconnect looped
@@ -3757,6 +3755,36 @@ class WhoopBleClient(
      *  [PuffinExperiment.resetFiveMGGatedProbes], so a 5/MG-only probe (raw capture, R22 deep-data
      *  write, broadcast-HR write) can't stay enabled across a switch and get applied to the wrong,
      *  unsupported strap. Same-family reconnects don't reset (the previous == new guard). */
+    /**
+     * Correct the connected strap's registry `model` label from [family] — the generation actually
+     * discovered on the peripheral. Called from onServicesDiscovered beside [persistSelectedModel],
+     * for the same reason that call is made there: it is the first point at which the family is
+     * known for certain, and it covers the easy-connect route that never scans at all.
+     *
+     * Replaces the #716 scan-callback stamp, which read the USER-SELECTED model. That defaults to
+     * WHOOP4 and was sampled on the first scan callback, before the advertised services were read —
+     * so a 5/MG reached via the scan-fallback rotation was stamped "WHOOP 4.0", and because that
+     * stamp was one-shot and only matched rows still labelled "WHOOP", nothing could ever correct
+     * it. Symptom is #716's: skin temp on the wrong ADC scale (#938) and 4.0 day charts.
+     *
+     * Row selection is deliberately narrow — the strap we are connected to by address, else the
+     * single active WHOOP row. [DeviceFamily.correctedRegistryModel] independently refuses to
+     * rewrite a label that names no WHOOP generation, so a mis-selected Oura/Polar row is a no-op
+     * rather than an identity change.
+     */
+    private fun correctRegistryModel(family: DeviceFamily) {
+        val address = lastDevice?.address
+        ioScope.launch {
+            val devices = runCatching { repository.pairedDevices() }.getOrNull() ?: return@launch
+            val row = devices.firstOrNull { address != null && it.peripheralId == address }
+                ?: devices.firstOrNull { it.status == "active" && it.brand == "WHOOP" }
+                ?: return@launch
+            val corrected = DeviceFamily.correctedRegistryModel(row.model, family) ?: return@launch
+            repository.setDeviceModel(row.id, corrected)
+            log("Registry model corrected: \"${row.model}\" -> \"$corrected\" (discovered family, #716 follow-up)")
+        }
+    }
+
     private fun persistSelectedModel(model: WhoopModel) {
         try {
             val prefs = context.getSharedPreferences("noop_prefs", Context.MODE_PRIVATE)
@@ -3807,22 +3835,12 @@ class WhoopBleClient(
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device: BluetoothDevice = result.device
             val name = result.scanRecord?.deviceName ?: device.name ?: "unknown"
-            // #716: the seeded "my-whoop" device has model "WHOOP" (no generation). Once a live
-            // scan confirms which service family the strap advertises, stamp the correct model so
-            // forRegistryModel returns the right DeviceFamily (fixes skin-temp ADC scale + display).
-            if (!modelStamped) {
-                modelStamped = true
-                ioScope.launch {
-                    val stale = repository.pairedDevices().firstOrNull {
-                        it.status == "active" && it.model == "WHOOP"
-                    }
-                    if (stale != null) {
-                        val correct = if (selectedModel == WhoopModel.WHOOP4) "WHOOP 4.0" else "WHOOP 5.0 / MG"
-                        repository.setDeviceModel(stale.id, correct)
-                        log("Updated device model from \"WHOOP\" to \"$correct\" (#716)")
-                    }
-                }
-            }
+            // #716's registry-model stamp used to live here. It read the USER-SELECTED model, which
+            // defaults to WHOOP4, and ran on the first scan callback — before the advertised
+            // services below were even read — so a 5/MG that matched the filter while the selection
+            // still said 4.0 was stamped "WHOOP 4.0" permanently. The stamp now happens in
+            // onServicesDiscovered via correctRegistryModel(), keyed off the family actually found
+            // on the peripheral; see that method for the full reasoning.
             val advertisedServiceUuids = result.scanRecord?.serviceUuids
                 ?.map { it.uuid.toString().lowercase() }
                 .orEmpty()
@@ -4483,6 +4501,7 @@ class WhoopBleClient(
                 // easy-connect route (getConnectedDevices / bondedDevices adopt, no scan) would never
                 // persist its model, leaving model-gated UI stale for a genuinely-connected strap.
                 persistSelectedModel(WhoopModel.WHOOP4)
+                correctRegistryModel(DeviceFamily.WHOOP4)
                 cmdCharacteristic = whoop4.getCharacteristic(CMD_WRITE_CHAR)
                 whoop4.getCharacteristic(CMD_NOTIFY_CHAR)?.let { cccdQueue.add(it) }
                 whoop4.getCharacteristic(EVENT_NOTIFY_CHAR)?.let { cccdQueue.add(it) }
@@ -4496,6 +4515,7 @@ class WhoopBleClient(
                 // gated on noop.selectedWhoopModel stay hidden until the strap is live-detected that
                 // session — even when it is the active paired device. This makes the choice stick.
                 persistSelectedModel(WhoopModel.WHOOP5_MG)
+                correctRegistryModel(DeviceFamily.WHOOP5)
                 log("WHOOP 5/MG detected — will send CLIENT_HELLO after subscribing (experimental).")
                 _state.update { it.copy(
                     whoop5Detected = true,

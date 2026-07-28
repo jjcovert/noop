@@ -100,6 +100,52 @@ enum class DeviceFamily {
             else -> WHOOP5
         }
 
+        /** The family-neutral label the seeded "my-whoop" row carries before any strap connects. */
+        private const val SEEDED_MODEL = "WHOOP"
+
+        /** Registry `model` spellings that positively identify a WHOOP 4.0 — same set [forRegistryModel] matches. */
+        private val WHOOP4_MODEL_LABELS = setOf("4.0", "WHOOP 4.0")
+
+        /**
+         * Registry `model` spellings that positively identify a WHOOP 5/MG.
+         *
+         * [forRegistryModel] cannot supply this: it maps *everything* unrecognised to WHOOP5 as a
+         * safe default, so it can't distinguish "a 5/MG label" from "an Oura label" — a distinction
+         * [correctedRegistryModel] needs before it rewrites anything.
+         */
+        private val WHOOP5_MODEL_LABELS = setOf("5.0 MG", "WHOOP 5.0 MG", "WHOOP 5.0 / MG")
+
+        /** The canonical label written for a family once it is confirmed on the peripheral. */
+        private fun canonicalRegistryModel(family: DeviceFamily): String = when (family) {
+            WHOOP4 -> "WHOOP 4.0"
+            WHOOP5 -> "WHOOP 5.0 / MG"
+        }
+
+        /**
+         * The registry `model` label a row should be corrected to now that the connected
+         * peripheral's family is known to be [confirmed] — or `null` to leave [currentLabel] alone.
+         *
+         * Callers should resolve [confirmed] from the services actually discovered on the
+         * peripheral, never from the user-selected model: the selection defaults to WHOOP4, and a
+         * 5/MG reached through the scan-fallback rotation or the easy-connect path is connected
+         * long after that default was read (#716 follow-up).
+         *
+         * Returns null whenever the stored spelling already resolves to [confirmed], so the
+         * Add-Device wizard's own spellings are not churned on every connect, and null for labels
+         * that name no WHOOP generation at all — otherwise a confirmed WHOOP4 would "correct" an
+         * Oura or Polar row into "WHOOP 4.0" and destroy its identity.
+         */
+        fun correctedRegistryModel(currentLabel: String?, confirmed: DeviceFamily): String? {
+            val label = currentLabel?.trim()
+            if (label.isNullOrEmpty() || label == SEEDED_MODEL) return canonicalRegistryModel(confirmed)
+            val labelled = when (label) {
+                in WHOOP4_MODEL_LABELS -> WHOOP4
+                in WHOOP5_MODEL_LABELS -> WHOOP5
+                else -> return null
+            }
+            return if (labelled == confirmed) null else canonicalRegistryModel(confirmed)
+        }
+
         /** Whoop 5.0 CLIENT_HELLO bytes (16 bytes). Exposed as a named constant for test/debug use. */
         val WHOOP5_CLIENT_HELLO: ByteArray = byteArrayOf(
             0xAA.toByte(), 0x01, 0x08, 0x00, 0x00, 0x01, 0xE6.toByte(), 0x71,
